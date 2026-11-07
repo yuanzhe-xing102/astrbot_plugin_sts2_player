@@ -1,0 +1,72 @@
+{
+  "sts2_url": {
+    "description": "游戏 mod 的本地 HTTP 地址：STS2-Agent 用 http://127.0.0.1:8080，老 STS2_MCP 用 http://127.0.0.1:15526（写错会自动试另一个端口）",
+    "type": "string",
+    "default": "http://127.0.0.1:15526"
+  },
+  "sts2_timeout_sec": {
+    "description": "单次请求超时秒数（游戏卡顿时不要设得太小）",
+    "type": "int",
+    "default": 20
+  },
+  "operator_ids": {
+    "description": "允许操作游戏的人（发送者 ID 列表），留空表示所有人可用",
+    "type": "list",
+    "default": []
+  },
+  "max_steps": {
+    "description": "一次 /sts2 自动 最多执行多少步（一步 = 读一次状态 + 一个动作）",
+    "type": "int",
+    "default": 40
+  },
+  "step_interval_sec": {
+    "description": "两步之间的间隔秒数（给游戏动画留时间，0.2-0.5 比较合适）",
+    "type": "float",
+    "default": 0.3
+  },
+  "report_every": {
+    "description": "自动模式下每多少步在聊天里播报一次战况",
+    "type": "int",
+    "default": 5
+  },
+  "use_llm": {
+    "description": "是否启用模型决策（关掉 = 纯规则机器人，0 token；打开 = 关键界面问一次模型）",
+    "type": "bool",
+    "default": false
+  },
+  "llm_combat": {
+    "description": "战斗中是否也问模型（很贵：一场战斗十几步；建议关，交给规则机器人）",
+    "type": "bool",
+    "default": false
+  },
+  "potion_hp_ratio": {
+    "description": "血量低于这个比例时规则机器人会喝药",
+    "type": "float",
+    "default": 0.32
+  },
+  "block_priority": {
+    "description": "格挡权重：调高更保守（叠甲更多、打得更慢），调低更激进（抢血）。本地模拟器上 0.15 最好，真实游戏里如果机器人被打死时手里全是 Defend，可以调到 0.6-1.0",
+    "type": "float",
+    "default": 0.15
+  },
+  "card_min": {
+    "description": "选牌阈值：卡牌评分高于这个数才拿（Rare 30 / Uncommon 20 / Common 12 起步）。调低卡组更厚，调高更精简",
+    "type": "float",
+    "default": 18
+  },
+  "auto_restart": {
+    "description": "这局死了之后自动回主菜单再开一局（一次 /sts2 自动 最多重开 3 次）。关掉的话死了就停下等你发指令",
+    "type": "bool",
+    "default": true
+  },
+  "goal": {
+    "description": "给模型的长期目标（会写进提示词）",
+    "type": "string",
+    "default": "稳一点打，先把这一局玩过关：优先保证不被秒，卡组补强核心输出。"
+  },
+  "llm_system_prompt": {
+    "description": "模型决策的系统提示词（留空使用插件内置的动作说明）",
+    "type": "text",
+    "default": ""
+  }
+}

@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+# 测试时 AstrBot 会在当前目录 bootstrap 一个 data/（默认模板），不是插件内容
+data/
+# trace_bot.py 的调试输出
+trace*.txt
+# 真机跑分日志
+run_*.log
+# 打包产物与临时解包目录
+dist/
+.pack_tmp/

@@ -1,0 +1,20 @@
+# 统一按文本处理，仓库里一律存 LF，检出时也不转 CRLF（Windows 上 git 默认会转，
+# 而 AstrBot 的插件校验/打包对换行不敏感，但换行漂移会让 diff 到处是噪声）。
+* text=auto eol=lf
+
+# 明确是文本的脚本
+*.py    text eol=lf
+*.md    text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.json  text eol=lf
+*.ps1   text eol=crlf
+*.bat   text eol=crlf
+
+# 二进制，别做任何转换
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.zip   binary
+*.dll   binary
+*.pck   binary
