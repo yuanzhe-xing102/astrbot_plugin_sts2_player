@@ -5,5 +5,13 @@ desc: 让 AI 玩《杀戮尖塔 2》：通过游戏 mod 的本地 HTTP 接口读
 version: v0.4.1
 author: yuanzhe-xing102
 repo: "https://github.com/yuanzhe-xing102/astrbot_plugin_sts2_player"
+social_link: "https://github.com/yuanzhe-xing102"
+tags:
+  - 游戏
+  - 自动化
+  - 杀戮尖塔2
+  - 单机游戏
+  - game
+  - automation
 astrbot_version: ">=4.16.0"
 support_platforms: []
