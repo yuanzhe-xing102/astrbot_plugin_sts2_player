@@ -876,6 +876,30 @@ def _card_damage(desc: str) -> int:
     return dmg * hits
 
 
+def _applies_vulnerable(desc: Any) -> bool:
+    """这张牌会不会给敌人挂「易伤」——挂完后续攻击伤害 +50%，所以值得先出。"""
+    text = str(desc or "")
+    low = text.lower()
+    if "vulnerable" in low:
+        return True
+    return "易伤" in text
+
+
+def _has_status(entity: dict, *names: str) -> bool:
+    """敌人身上有没有某个状态。真机 powers 的形态不固定，dict/str 都认。"""
+    wanted = {n.lower() for n in names}
+    for item in entity.get("status") or []:
+        if isinstance(item, dict):
+            keys = ("name", "display_name", "status_name", "id", "status_id")
+            for k in keys:
+                v = item.get(k)
+                if v and str(v).lower() in wanted:
+                    return True
+        elif str(item).lower() in wanted:
+            return True
+    return False
+
+
 def _intent_damage(enemy: dict) -> int:
     """把意图粗估成伤害数字：攻击意图优先用 label（"11"、"6x2"、"4×2"），否则读描述。"""
     total = 0
@@ -1266,6 +1290,38 @@ class RuleBot:
         # 这一手一张攻击牌都打不出去（没有/费用不够）：格挡牌留着也没别的用途
         idle = not has_attack
 
+        # 手上的攻击总量：用来判断「先挂易伤再打」到底能多打多少伤害
+        attack_total = sum(
+            _card_damage(c.get("description") or "")
+            for c in player.get("hand") or []
+            if str(c.get("type") or "") == "Attack"
+            and c.get("can_play") is not False
+            and _cost(c) <= energy
+        )
+
+        # 这一回合打不死对面、手上又有易伤牌：先挂易伤，后面每张攻击牌都多打一半。
+        # 只在「这场架还要打好几回合」时才值得绕路，一回合能收掉就别磨蹭。
+        attack_cards = [
+            c for c in player.get("hand") or []
+            if str(c.get("type") or "") == "Attack"
+            and c.get("can_play") is not False
+            and _cost(c) <= energy
+        ]
+        longest = max(((e.get("hp") or 0) for e in enemies), default=0)
+        if len(attack_cards) >= 2 and longest >= attack_total * 2:
+            if not lethal_turn and need <= max(1.0, hp * 0.3):
+                for card in player.get("hand") or []:
+                    if card.get("can_play") is False or _cost(card) > energy:
+                        continue
+                    if not _applies_vulnerable(str(card.get("description") or "")):
+                        continue
+                    tgt = self._pick_target(enemies, 0)
+                    if self._needs_vulnerable(enemies, tgt):
+                        act = {"action": "play_card", "card_index": card.get("index")}
+                        if tgt:
+                            act["target"] = tgt
+                        return act
+
         for card in player.get("hand") or []:
             if card.get("can_play") is False:
                 continue
@@ -1373,6 +1429,14 @@ class RuleBot:
             return 0.8, None
 
         return 0.3, None
+
+    @staticmethod
+    def _needs_vulnerable(enemies: list[dict], target_id: str | None) -> bool:
+        """目标身上还没有易伤，才值得先给它挂一层。"""
+        for e in enemies:
+            if target_id is None or str(e.get("entity_id")) == str(target_id):
+                return not _has_status(e, "Vulnerable", "易伤")
+        return False
 
     @staticmethod
     def _pick_target(enemies: list[dict], dmg: int) -> str | None:

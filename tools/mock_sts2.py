@@ -72,7 +72,7 @@ def build_deck() -> list[dict]:
     for _ in range(4):
         deck.append(_card("DEFEND_R", "Defend", "Skill", "1", "Gain 5 Block.", block=5))
     deck.append(_card("BASH", "Bash", "Attack", "2", "Deal 8 damage. Apply 2 Vulnerable.",
-                      target_type="AnyEnemy", dmg=8))
+                      target_type="AnyEnemy", dmg=8, vuln=2))
     deck.append(_card("INFLAME", "Inflame", "Power", "1", "Gain 2 Strength.", strength=2))
     return deck
 
@@ -322,9 +322,23 @@ class Game:
                            if s.get("id") == "STRENGTH")
             dmg += strength
             if enemy is not None:
+                # 易伤：受到的攻击伤害 +50%，这是「先挂易伤再打」的收益来源
+                if any(s.get("id") == "VULNERABLE" for s in enemy.get("status", [])):
+                    dmg = int(dmg * 1.5)
                 absorbed = min(enemy["block"], dmg)
                 enemy["block"] -= absorbed
                 enemy["hp"] = max(0, enemy["hp"] - (dmg - absorbed))
+        if card.get("vuln") and enemy is not None and enemy["hp"] > 0:
+            stack = next((s for s in enemy.setdefault("status", [])
+                          if s.get("id") == "VULNERABLE"), None)
+            if stack is None:
+                enemy["status"].append({
+                    "id": "VULNERABLE", "name": "Vulnerable", "amount": int(card["vuln"]),
+                    "type": "Debuff", "description": "Takes 50% more damage from attacks.",
+                    "keywords": [],
+                })
+            else:
+                stack["amount"] = int(stack.get("amount", 0)) + int(card["vuln"])
         if card.get("block"):
             self.player["block"] += card["block"]
         if card.get("draw"):
@@ -363,6 +377,12 @@ class Game:
         for e in self.alive_enemies():
             e["pattern_idx"] = e.get("pattern_idx", 0) + 1
             self._set_intent(e)
+            # 易伤按回合数衰减，掉光就没了
+            for s in list(e.get("status") or []):
+                if s.get("id") == "VULNERABLE":
+                    s["amount"] = int(s.get("amount", 0)) - 1
+                    if s["amount"] <= 0:
+                        e["status"].remove(s)
         self.hand = []
         self.draw(5)
         self.message = f"敌人攻击造成了 {taken} 点伤害（护甲挡下 {incoming - taken}）。"

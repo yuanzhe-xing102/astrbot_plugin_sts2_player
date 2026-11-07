@@ -158,6 +158,8 @@ async def main() -> int:
 
     # ---- 卡组构筑层：选牌/升级/删牌都要看整副牌，而不是只看单卡 ----
     check_deck_sense(plugin.bot)
+    # ---- 连招层：能挂易伤就先挂，后面的攻击牌全部 +50% ----
+    check_vuln_order(plugin.bot)
 
     await plugin.client.close()
     server.shutdown()
@@ -279,6 +281,42 @@ def check_deck_sense(bot) -> None:
     print("✓ 商店：牌组厚时买删牌服务")
 
 
+def check_vuln_order(bot) -> None:
+    """连招层：这一回合打不死对面时，先挂易伤再动手。"""
+    def combat_state(hand, energy=3, enemy_hp=80, enemy_status=None, incoming=10):
+        return {
+            "state_type": "monster",
+            "player": {"hp": 70, "max_hp": 80, "block": 0, "energy": energy,
+                       "hand": indexed(hand), "potions": []},
+            "battle": {
+                "round": 1, "turn": "player", "is_play_phase": True,
+                "enemies": [{
+                    "entity_id": "0", "name": "小怪", "hp": enemy_hp, "max_hp": enemy_hp,
+                    "block": 0, "status": enemy_status or [],
+                    "intents": [{"type": "Attack", "label": str(incoming), "description": ""}],
+                }],
+            },
+        }
+
+    bash = card("痛击", "Attack", "2", "造成8点伤害。施加2层易伤。")
+    strike = card("打击", "Attack", "1", "造成6点伤害。")
+
+    # 1) 打不死对面 → 先痛击（挂易伤），而不是先打一张打击
+    act = bot.next_action(combat_state([bash, strike, strike], energy=3, enemy_hp=80))
+    assert act and act["action"] == "play_card" and act["card_index"] == 0, f"没有先挂易伤：{act}"
+    print("✓ 连招：打不死时先挂易伤")
+
+    # 2) 对面身上已经有易伤 → 别再挂，直接打伤害
+    act = bot.next_action(combat_state([bash, strike, strike], energy=3, enemy_hp=80,
+                                       enemy_status=[{"name": "Vulnerable"}]))
+    assert act and act["action"] == "play_card" and act["card_index"] != 0, f"重复挂易伤：{act}"
+    print("✓ 连招：已有易伤就不重复挂")
+
+    # 3) 这一回合能打死 → 不要为了易伤拖节奏，直接斩杀
+    act = bot.next_action(combat_state([bash, strike, strike], energy=3, enemy_hp=12))
+    assert act and act["action"] == "play_card" and act["card_index"] != 0, f"能斩杀却先挂易伤：{act}"
+    print("✓ 连招：能斩杀时优先斩杀")
+
+
 if __name__ == "__main__":
     raise SystemExit(asyncio.run(main()))
-
