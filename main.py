@@ -635,6 +635,7 @@ def agent_to_legacy(d: dict) -> dict:
                         "category": cat,
                         "price": int(price or 0),
                         "is_stocked": True,
+                        "available": bool(it.get("available", True)),
                         "can_afford": bool(it.get("enough_gold", True)),
                         "name": it.get("name"),
                         "card_name": it.get("name"),
@@ -684,12 +685,29 @@ def agent_to_legacy(d: dict) -> dict:
 
     if screen == "CARD_SELECTION":
         sel = d.get("selection") or {}
+        # 多选屏：原生界面要你点够 min_select~max_select 张，点满或 confirm_selection 才收尾。
+        try:
+            selected = int(sel.get("selected_count") or 0)
+        except (TypeError, ValueError):
+            selected = 0
+        try:
+            max_select = int(sel.get("max_select") or 1)
+        except (TypeError, ValueError):
+            max_select = 1
+        try:
+            min_select = int(sel.get("min_select") or 0)
+        except (TypeError, ValueError):
+            min_select = 0
         out["card_select"] = {
             "kind": sel.get("kind"),
             "prompt": sel.get("prompt") or "",
+            "selected_count": selected,
+            "min_select": min_select,
+            "max_select": max(1, max_select),
             "cards": [
                 {
                     "index": c.get("index"),
+                    "selected": bool(c.get("selected")),
                     "id": c.get("card_id"),
                     "name": c.get("name"),
                     "type": _card_kind(
@@ -1162,10 +1180,19 @@ class RuleBot:
         self.potion_hp_ratio = potion_hp_ratio
         self.block_priority = block_priority
         self.card_min = card_min
+        # 商店里已经买失败的条目，别在同一屏里反复重试（会把「连续失败 3 次」耗光）
+        self._bad_buys: set[tuple] = set()
+        # 选牌屏的本地进度（有些后端不给 selected_count，只能自己数）
+        self._sel_key: tuple | None = None
+        self._sel_count = 0
+        self._sel_picked: set = set()
+        self._sel_confirmed = False
 
     # -- 入口：把 state_type 分发到具体处理器 --
     def next_action(self, st: dict) -> dict | None:
         stype = str(st.get("state_type") or "")
+        if stype not in ("shop", "fake_merchant"):
+            self._bad_buys.clear()
         if stype in COMBAT_SCREENS:
             return self._combat(st)
         handler = {
@@ -1522,8 +1549,13 @@ class RuleBot:
         opts = [o for o in (ev.get("options") or []) if not o.get("is_locked")]
         if not opts:
             return None
-        pick = next((o for o in opts if not o.get("is_proceed")), opts[0])
-        return {"action": "choose_event_option", "index": pick.get("index")}
+        player = st.get("player") or {}
+        hp_ratio = float(player.get("hp") or 0) / (float(player.get("max_hp") or 1) or 1.0)
+        gold = int(player.get("gold") or 0)
+        leaves = [o for o in opts if o.get("is_proceed")]
+        real = [o for o in opts if not o.get("is_proceed")] or leaves
+        best = max(real, key=lambda o: _event_option_score(o, hp_ratio, gold))
+        return {"action": "choose_event_option", "index": best.get("index")}
 
     def _rest(self, st: dict) -> dict:
         opts = [o for o in (st.get("rest_site") or {}).get("options") or [] if o.get("is_enabled", True)]
@@ -1555,13 +1587,24 @@ class RuleBot:
         gold = int(player.get("gold") or 0)
         potions = [p for p in (player.get("potions") or []) if p.get("potion_id")]
         slots = int(player.get("max_potion_slots") or 3)
-        items = [i for i in (shop.get("items") or []) if i.get("is_stocked", True)]
+        items = [
+            i
+            for i in (shop.get("items") or [])
+            if i.get("is_stocked", True)
+            and i.get("available", True)
+            and (i.get("category"), i.get("index")) not in self._bad_buys
+        ]
         prof = _deck_profile(player.get("deck"))
 
         buy: dict | None = None
         for it in items:
             price = _price(it)
-            if it.get("category") == "potion" and len(potions) < slots and 0 < price <= gold:
+            if (
+                it.get("category") == "potion"
+                and len(potions) < slots
+                and it.get("can_afford", True)
+                and 0 < price <= gold
+            ):
                 buy = {"action": "shop_purchase", "index": it.get("index"), "category": "potion"}
                 break
         if buy is None:
@@ -1570,7 +1613,7 @@ class RuleBot:
                 if it.get("category") != "card":
                     continue
                 price = _price(it)
-                if price <= 0 or price > gold - 30:  # 留点钱
+                if price <= 0 or price > gold - 30 or not it.get("can_afford", True):  # 留点钱
                     continue
                 card = {
                     "type": it.get("card_type"),
@@ -1623,25 +1666,63 @@ class RuleBot:
 
     def _card_select(self, st: dict) -> dict | None:
         cs = st.get("card_select") or {}
-        if cs.get("can_confirm"):
-            return {"action": "confirm_selection"}
-        cards = cs.get("cards") or []
+        cards = [c for c in (cs.get("cards") or []) if c.get("index") is not None]
         if not cards:
+            if cs.get("can_confirm"):
+                return {"action": "confirm_selection"}
             if cs.get("can_cancel"):
                 return {"action": "cancel_selection"}
             return None
-        kind = str(cs.get("kind") or "")
+        kind = str(cs.get("kind") or "").lower()
         prompt = str(cs.get("prompt") or "").lower()
+        try:
+            chosen = int(cs.get("selected_count") or 0)
+        except (TypeError, ValueError):
+            chosen = 0
+        marked = sum(1 for c in cards if c.get("selected"))
+        if marked > chosen:
+            chosen = marked
+        try:
+            want = max(1, int(cs.get("max_select") or 1))
+        except (TypeError, ValueError):
+            want = 1
+        want = min(want, len(cards))
+        # 模拟器/老接口不给 selected 计数，靠本地记「这一屏我点过几张」
+        key = (kind, prompt)
+        if key != self._sel_key:
+            self._sel_key = key
+            self._sel_count = 0
+            self._sel_picked = set()
+            self._sel_confirmed = False
+        # 上一次确认过、这一屏又回到「一张都没选」= 是新的一次选牌，本地计数要清零
+        if self._sel_confirmed and chosen == 0 and marked == 0:
+            self._sel_count = 0
+            self._sel_picked = set()
+            self._sel_confirmed = False
+        if marked or cs.get("selected_count") is not None:
+            self._sel_count = chosen
+        # 选够了就收尾，别在界面里空转
+        if self._sel_count >= want or chosen >= want:
+            self._sel_confirmed = True
+            return {"action": "confirm_selection"}
         # 真机上「删牌」和「事件选牌」都用 deck_card_select 这个 kind，只能靠提示语区分
         if "upgrade" in kind or "升级" in prompt:
-            pick = max(cards, key=_upgrade_value)
+            order = sorted(cards, key=_upgrade_value, reverse=True)
         elif "remove" in kind or "移除" in prompt or "删" in prompt:
-            pick = _worst_card(cards) or cards[0]
+            order = sorted(cards, key=lambda c: _card_strength(c))
         else:
-            # transform / 事件选牌这类：按当前卡组缺口挑
             prof = _deck_profile((st.get("player") or {}).get("deck"))
-            pick = max(cards, key=lambda c: _deck_fit(c, prof))
-        return {"action": "select_card", "index": pick.get("index")}
+            order = sorted(cards, key=lambda c: _deck_fit(c, prof), reverse=True)
+        # 每一步都重读状态，所以「点过哪些」只用来跳过已经选中的牌；
+        # 同一张牌重复点会被原生界面当成又一次点击（状态不变），必须换下一张。
+        for c in order:
+            if c.get("selected") or c.get("index") in self._sel_picked:
+                continue
+            self._sel_picked.add(c.get("index"))
+            self._sel_count += 1
+            return {"action": "select_card", "index": c.get("index")}
+        self._sel_confirmed = True
+        return {"action": "confirm_selection"}
 
     def _bundle_select(self, st: dict) -> dict | None:
         bs = st.get("bundle_select") or {}
@@ -1848,20 +1929,59 @@ def _upgrade_value(card: dict) -> float:
     return score
 
 
+def _card_strength(card: dict) -> float:
+    """一张牌的大致战斗力，删牌时挑最弱的。"""
+    desc = str(card.get("description") or "")
+    val = _card_damage(desc) * 1.2 + _card_block(desc) * 1.0
+    ctype = str(card.get("type") or "")
+    if ctype == "Power":
+        val += 12.0
+    if ctype == "Curse":
+        val -= 30.0
+    return val
+
+
 def _worst_card(cards: list[dict]) -> dict | None:
     """删牌目标：基础打击/防御最该删，其次是纯数值低的牌。"""
     if not cards:
         return None
-    def strength(c: dict) -> float:
-        desc = str(c.get("description") or "")
-        val = _card_damage(desc) * 1.2 + _card_block(desc) * 1.0
-        ctype = str(c.get("type") or "")
-        if ctype == "Power":
-            val += 12.0
-        if ctype == "Curse":
-            val -= 30.0
-        return val
-    return min(cards, key=strength)
+    return min(cards, key=_card_strength)
+
+
+def _event_option_score(opt: dict, hp_ratio: float, gold: int) -> float:
+    """事件选项打分：能拿遗物/加血/升级就选，要花大半金币或塞诅咒就躲。"""
+    text = _strip_bbcode(f"{opt.get('title') or ''} {opt.get('description') or ''}")
+    low = text.lower()
+    score = 0.0
+    # 金币成本：只看「N 金币」这种写法，避免把伤害数字当成价格
+    cost = 0
+    for m in re.finditer(r"(\d+)\s*金币", text):
+        cost = max(cost, int(m.group(1)))
+    if cost > gold:
+        score -= 40.0
+    elif cost and cost > gold * 0.7:
+        score -= 10.0
+    if ("遗物" in text) or ("relic" in low):
+        score += 12.0
+    if ("最大生命" in text) or ("max hp" in low):
+        score += 8.0
+    if ("回复" in text) or ("治疗" in text) or ("heal" in low):
+        score += 10.0 if hp_ratio < 0.6 else 5.0
+    if ("升级" in text) or ("upgrade" in low):
+        score += 6.0
+    if ("移除" in text) or ("remove" in low):
+        # 一次删两张会把牌组抽干，只在牌组够厚时才算好事
+        score += 1.0 if re.search(r"移除\s*[^\d]{0,6}2", text) else 4.0
+    if ("诅咒" in text) or ("curse" in low):
+        score -= 12.0
+    if ("孢子" in text) or ("spore" in low):
+        score -= 6.0
+    if ("失去" in text) or ("受伤" in text) or ("lose" in low):
+        score -= 10.0 if hp_ratio < 0.5 else 2.0
+    # 纯「离开」类选项排最后，除非别的都不可选
+    if opt.get("is_proceed"):
+        score -= 5.0
+    return score
 
 
 # ---------------------------------------------------------------------------
@@ -2129,6 +2249,12 @@ class Sts2PlayerPlugin(Star):
                         return
                     if str(res.get("status")) == "error":
                         errors += 1
+                        if name == "shop_purchase":
+                            # 这一格买不了（买不起 / 药水位满 / 已售出），本次进店就别再试它
+                            try:
+                                self.bot._bad_buys.add((params.get("category"), params.get("index")))
+                            except Exception:  # noqa: BLE001
+                                pass
                         log.append(f"✗ {name} {params} → {_one_line(res.get('error'), 100)}")
                         if errors >= 3:
                             yield event.plain_result(
