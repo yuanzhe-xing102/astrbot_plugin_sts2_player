@@ -160,6 +160,8 @@ async def main() -> int:
     check_deck_sense(plugin.bot)
     # ---- 连招层：能挂易伤就先挂，后面的攻击牌全部 +50% ----
     check_vuln_order(plugin.bot)
+    # ---- 适配层：STS2-Agent 的原生 payload 要能映射成规则层认识的形状 ----
+    check_agent_shapes(plugin.bot, mod)
 
     await plugin.client.close()
     server.shutdown()
@@ -316,6 +318,136 @@ def check_vuln_order(bot) -> None:
     act = bot.next_action(combat_state([bash, strike, strike], energy=3, enemy_hp=12))
     assert act and act["action"] == "play_card" and act["card_index"] != 0, f"能斩杀却先挂易伤：{act}"
     print("✓ 连招：能斩杀时优先斩杀")
+
+
+def check_agent_shapes(bot, mod) -> None:
+    """STS2-Agent 的原生 payload → 规则层动作。
+
+    这一层最容易出错：适配层吃掉一个字段，规则层就会「不知道为什么不动」。
+    之前的两个真机 bug（营火不动、多选删牌卡死）都出在这里。
+    """
+    deck = deck_of(3, 2, [card("痛击", "Attack", "2", "造成8点伤害。给予2层易伤。")])
+
+    # 1) 营火：血多且牌能升级 → 选 SMITH 并把 index 带对
+    rest_payload = {
+        "screen": "REST",
+        "run": {"current_hp": 70, "max_hp": 80, "gold": 99},
+        "player": {"current_hp": 70, "max_hp": 80, "gold": 99},
+        "rest": {
+            "options": [
+                {"index": 0, "option_id": "HEAL", "title": "休息", "description": "回复30%生命", "is_enabled": True},
+                {"index": 1, "option_id": "SMITH", "title": "锻造", "description": "升级一张牌", "is_enabled": True},
+            ]
+        },
+    }
+    _patch_run_deck(rest_payload, deck)
+    st = mod.agent_to_legacy(rest_payload)
+    assert st["state_type"] == "rest_site", f"营火没映射成 rest_site：{st['state_type']}"
+    assert len((st.get("rest_site") or {}).get("options") or []) == 2, "营火选项被吃掉了"
+    act = bot.next_action(st)
+    assert act and act["action"] == "choose_rest_option" and act["index"] == 1, f"满血该升级：{act}"
+
+    # 2) 营火：血少 → 睡觉
+    _set_hp(rest_payload, 20)
+    st = mod.agent_to_legacy(rest_payload)
+    act = bot.next_action(st)
+    assert act and act["action"] == "choose_rest_option" and act["index"] == 0, f"残血该睡觉：{act}"
+
+    # 2b) 营火：选项没给 option_id、只有中文标题时也要认出来
+    bare = {
+        "screen": "REST",
+        "run": {"current_hp": 20, "max_hp": 80, "gold": 10},
+        "rest": {"options": [{"index": 0, "title": "休息"}, {"index": 1, "title": "锻造"}]},
+    }
+    _patch_run_deck(bare, deck)
+    st = mod.agent_to_legacy(bare)
+    ids = [o["id"] for o in (st.get("rest_site") or {}).get("options") or []]
+    assert ids == ["rest", "smith"], f"按标题兜底失败：{ids}"
+    act = bot.next_action(st)
+    assert act and act["action"] == "choose_rest_option" and act["index"] == 0, f"残血该选休息：{act}"
+
+    # 2c) 营火：options 整个缺失，但引擎说能选 → 盲点 0，不能直接走出去
+    empty = {
+        "screen": "REST",
+        "run": {"current_hp": 20, "max_hp": 80, "gold": 10},
+        "available_actions": ["choose_rest_option", "proceed", "save_and_quit"],
+        "rest": {},
+    }
+    _patch_run_deck(empty, deck)
+    act = bot.next_action(mod.agent_to_legacy(empty))
+    assert act and act["action"] == "choose_rest_option", f"营火没选项时该盲选：{act}"
+
+    # 3) 多选删牌：要选两张，且不能反复点同一张，选够后确认
+    sel_payload = {
+        "screen": "CARD_SELECTION",
+        "run": {"current_hp": 50, "max_hp": 80, "gold": 10},
+        "player": {"current_hp": 50, "max_hp": 80, "gold": 10},
+        "selection": {
+            "kind": "deck_card_select",
+            "prompt": "选择2张牌来移除",
+            "min_select": 2,
+            "max_select": 2,
+            "selected_count": 0,
+            "cards": [
+                {"index": 0, "card_id": "STRIKE", "name": "打击", "selected": False,
+                 "resolved_rules_text": "造成6点伤害。"},
+                {"index": 1, "card_id": "DEFEND", "name": "防御", "selected": False,
+                 "resolved_rules_text": "获得5点格挡。"},
+                {"index": 2, "card_id": "BASH", "name": "痛击", "selected": False,
+                 "resolved_rules_text": "造成8点伤害。给予2层易伤。"},
+            ],
+        },
+    }
+    _patch_run_deck(sel_payload, deck)
+    picked = []
+    for _ in range(3):
+        st = mod.agent_to_legacy(sel_payload)
+        act = bot.next_action(st)
+        assert act, "多选界面没有动作"
+        if act["action"] == "select_card":
+            picked.append(act["index"])
+            for c in sel_payload["selection"]["cards"]:
+                if c["index"] == act["index"]:
+                    c["selected"] = True
+            sel_payload["selection"]["selected_count"] = len(picked)
+        else:
+            break
+    assert picked and len(set(picked)) == len(picked), f"同一张牌被点了两次：{picked}"
+    assert picked[0] in (0, 1), f"删牌该先删基础牌，却选了 {picked[0]}"
+    assert act and act["action"] == "confirm_selection", f"选够两张后该确认：{act}"
+
+    # 4) 商店：available=false 的货不许买
+    shop_payload = {
+        "screen": "SHOP",
+        "run": {"current_hp": 60, "max_hp": 80, "gold": 300},
+        "player": {"current_hp": 60, "max_hp": 80, "gold": 300},
+        "shop": {
+            "is_open": False,
+            "can_open": True,
+            "cards": [
+                {"index": 0, "name": "重锤", "card_type": "Attack", "price": 77,
+                 "available": False, "enough_gold": True, "is_stocked": True,
+                 "resolved_rules_text": "造成32点伤害。"},
+            ],
+            "relics": [],
+            "potions": [],
+        },
+    }
+    _patch_run_deck(shop_payload, deck)
+    st = mod.agent_to_legacy(shop_payload)
+    act = bot.next_action(st)
+    assert act and act["action"] != "shop_purchase", f"买不到的货还去点：{act}"
+    print("✓ 适配层：营火/多选删牌/商店不可售货")
+
+
+def _set_hp(payload: dict, hp: int) -> None:
+    """血量的真源是 run.current_hp；player.current_hp 只是镜像，两边都要改。"""
+    payload.setdefault("run", {})["current_hp"] = hp
+    payload.setdefault("player", {})["current_hp"] = hp
+
+
+def _patch_run_deck(payload: dict, deck: list[dict]) -> None:
+    payload.setdefault("run", {})["deck"] = deck
 
 
 if __name__ == "__main__":

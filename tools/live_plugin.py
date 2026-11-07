@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib.util
+import json
 import shutil
 import sys
 from pathlib import Path
@@ -137,6 +138,26 @@ async def run(args) -> int:
 
         plugin.client.act = traced  # type: ignore[method-assign]
 
+    if args.dump_rest:
+        # 抓一次真机营火的原始 payload，用来核对适配层字段（只写第一次）
+        orig_state = plugin.client.state
+        dumped = {"done": False}
+
+        async def state_and_dump(fmt: str = "json"):
+            st = await orig_state(fmt)
+            if not dumped["done"] and st.get("state_type") == "rest_site":
+                raw = getattr(plugin.client, "last_raw", None)
+                if raw:
+                    path = Path("rest_raw.json")
+                    path.write_text(
+                        json.dumps(raw, ensure_ascii=False, indent=2), encoding="utf-8"
+                    )
+                    print(f"    · 已把真机营火原始状态写到 {path}")
+                    dumped["done"] = True
+            return st
+
+        plugin.client.state = state_and_dump  # type: ignore[method-assign]
+
     async for msg in plugin._auto(event, args.steps):
         steps += 1
         print(f"\n[{steps}] {msg}")
@@ -157,6 +178,7 @@ def main() -> int:
     p.add_argument("--use-llm", action="store_true")
     p.add_argument("--start-run", action="store_true", help="在主菜单时自动开一局")
     p.add_argument("--verbose", action="store_true")
+    p.add_argument("--dump-rest", action="store_true", help="遇到营火时把原生状态写到 rest_raw.json")
     args = p.parse_args()
 
     try:

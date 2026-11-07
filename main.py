@@ -123,7 +123,8 @@ class Sts2Client:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
         self._session: aiohttp.ClientSession | None = None
-        self._mode: str | None = None  # "agent"（STS2-Agent）或 "mcp"（STS2_MCP）
+        self._mode: str | None = None
+        self.last_raw: dict | None = None  # "agent"（STS2-Agent）或 "mcp"（STS2_MCP）
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -276,7 +277,10 @@ class Sts2Client:
                     f"读游戏状态失败：{err.get('code') or status} "
                     f"{err.get('message') or str(data)[:160]}"
                 )
-            return agent_to_legacy(data.get("data") or {})
+            payload = data.get("data") or {}
+            # 留着原始那一坨，调试界面形状时用得上（见 tools/live_plugin.py）
+            self.last_raw = payload
+            return agent_to_legacy(payload)
         return await self.request(
             "GET", "/api/v1/singleplayer", params={"format": fmt}
         )
@@ -602,22 +606,33 @@ def agent_to_legacy(d: dict) -> dict:
         }
 
     if screen == "REST":
-        rs = d.get("rest") or {}
-        out["rest_site"] = {
-            "options": [
+        rs = d.get("rest") or d.get("rest_site") or {}
+        options: list[dict] = []
+        for i, o in enumerate(rs.get("options") or []):
+            oid = o.get("option_id") or o.get("id") or o.get("type") or ""
+            name = o.get("title") or o.get("name") or o.get("line") or ""
+            if not oid:
+                # 真机上万一没给 option_id，就用标题兜底认一下
+                title = str(name)
+                if any(k in title for k in ("休息", "回复", "治疗", "Heal", "Rest")):
+                    oid = "HEAL"
+                elif any(k in title for k in ("锻造", "升级", "Smith", "Upgrade")):
+                    oid = "SMITH"
+            index = o.get("index")
+            options.append(
                 {
-                    "index": o.get("index"),
+                    "index": i if index is None else index,
                     "id": {"HEAL": "rest", "SMITH": "smith"}.get(
-                        str(o.get("option_id")), str(o.get("option_id") or "").lower()
+                        str(oid).upper(), str(oid).lower()
                     ),
-                    "name": o.get("title") or "",
+                    "name": name,
                     "description": o.get("description") or "",
-                    "is_enabled": bool(o.get("is_enabled", True)),
+                    "is_enabled": bool(
+                        o.get("is_enabled", o.get("enabled", o.get("can_select", True)))
+                    ),
                 }
-                for o in rs.get("options") or []
-            ],
-            "can_proceed": True,
-        }
+            )
+        out["rest_site"] = {"options": options, "can_proceed": True}
 
     if screen in ("SHOP", "FAKE_MERCHANT"):
         sh = d.get("shop") or {}
@@ -1560,6 +1575,14 @@ class RuleBot:
     def _rest(self, st: dict) -> dict:
         opts = [o for o in (st.get("rest_site") or {}).get("options") or [] if o.get("is_enabled", True)]
         if not opts:
+            # 真机上偶尔拿不到 options 列表（或全被标成不可用）：只要引擎说这一步能选，
+            # 就盲点第一个 —— 营火默认第一个是休息，比直接走出门强。
+            if "choose_rest_option" in (st.get("available_actions") or []):
+                return {"action": "choose_rest_option", "index": 0}
+            return {"action": "proceed"}
+        acts = st.get("available_actions") or []
+        if acts and "choose_rest_option" not in acts and "proceed" in acts:
+            # 引擎这边已经不给选选项了（比如睡过了），只剩「继续」
             return {"action": "proceed"}
         player = st.get("player") or {}
         ratio = float(player.get("hp") or 0) / (float(player.get("max_hp") or 1) or 1.0)

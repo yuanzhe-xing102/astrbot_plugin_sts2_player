@@ -9,3 +9,6 @@ run_*.log
 # 打包产物与临时解包目录
 dist/
 .pack_tmp/
+probe_*.log
+rest_raw*.json
+run_*.log
