@@ -491,6 +491,10 @@ def agent_to_legacy(d: dict) -> dict:
                 "can_play": bool(c.get("playable", True)),
                 "unplayable_reason": c.get("unplayable_reason"),
                 "is_upgraded": bool(c.get("upgraded")),
+                # 引擎算好的真值（含力量/虚弱），给渲染层显示「实际」数值
+                "dynamic_values": c.get("dynamic_values") or [],
+                "resolved_damage": _resolved_damage(c),
+                "resolved_block": _resolved_block(c),
             }
         )
 
@@ -736,6 +740,8 @@ def agent_to_legacy(d: dict) -> dict:
             out["shop"]["items"].append(
                 {
                     "index": 90,  # 删牌服务不是货架商品，单独给个不会撞车的号
+                    # 但发给引擎时必须用引擎自己的 option_index，否则 invalid_target
+                    "native_index": removal.get("index"),
                     "category": "card_removal",
                     "price": int(price or 0),
                     "is_stocked": True,
@@ -874,7 +880,8 @@ def agent_action(action: str, params: dict) -> tuple[str | None, dict]:
     if action == "shop_purchase":
         cat = str(params.get("category") or "card")
         if cat == "card_removal":
-            # 删牌服务不是货架商品：买完直接进「从牌库选一张删掉」的界面
+            # 删牌服务不是货架商品：买完直接进「从牌库选一张删掉」的界面。
+            # 引擎的 card_removal 里没有 index，这个动作就是不带参数发出去。
             return "remove_card_at_shop", {}
         native = {
             "card": "buy_card",
@@ -947,6 +954,37 @@ def _self_hp_cost(desc: str) -> int:
     if not m:
         m = re.search(r"失去\s*(\d+)\s*点?生命", desc)
     return int(m.group(1)) if m else 0
+
+
+def _dyn(card: dict, *names: str) -> float | None:
+    """从引擎给的 dynamic_values 里取值（这是「算完力量/虚弱之后」的真值）。"""
+    wanted = {n.lower() for n in names}
+    for item in card.get("dynamic_values") or []:
+        if not isinstance(item, dict):
+            continue
+        key = str(item.get("name") or item.get("id") or "").lower()
+        if key in wanted:
+            for field in ("current_value", "value", "base_value"):
+                v = item.get(field)
+                if isinstance(v, (int, float)):
+                    return float(v)
+    return None
+
+
+def _resolved_damage(card: dict) -> int:
+    """这张牌此刻打出去到底多少伤害：优先引擎真值，其次从文本估。"""
+    dmg = _dyn(card, "damage", "Damage", "伤害")
+    if dmg is None:
+        return _card_damage(str(card.get("description") or ""))
+    hits = _dyn(card, "hits", "Hits", "段数", "times")
+    return int(round(dmg * (hits if hits and hits > 0 else 1)))
+
+
+def _resolved_block(card: dict) -> int:
+    block = _dyn(card, "block", "Block", "格挡")
+    if block is None:
+        return _card_block(str(card.get("description") or ""))
+    return int(round(block))
 
 
 def _card_damage(desc: str) -> int:
@@ -1027,6 +1065,13 @@ def _fmt_card(card: dict) -> str:
         f"{card.get('cost')}费",
         _one_line(card.get("description"), 52),
     ]
+    # 引擎算过的实际值：文本说「造成6点伤害」，实际可能是 7（力量）或 8（易伤）
+    dmg = card.get("resolved_damage")
+    block = card.get("resolved_block")
+    if isinstance(dmg, int) and dmg > 0:
+        bits.append(f"→实际{dmg}伤")
+    if isinstance(block, int) and block > 0:
+        bits.append(f"→实际{block}挡")
     if card.get("can_play") is False:
         bits.append(f"（{card.get('unplayable_reason') or '不可用'}）")
     return " ".join(b for b in bits if b)
@@ -1084,6 +1129,17 @@ def render_state(st: dict, *, pile_limit: int = 8) -> str:
                 + (f" 意图：{intents}" if intents else "")
             )
         hand = player.get("hand") or []
+        # 本回合算术：敌人这回合打你多少、现有护甲够不够、手牌最狠能打多少
+        incoming = sum(_intent_damage(e) for e in battle.get("enemies") or [] if e.get("hp", 0) > 0)
+        if incoming or hand:
+            block_now = player.get("block", 0) or 0
+            best_dmg = max((c.get("resolved_damage") or 0) for c in hand) if hand else 0
+            total_dmg = sum(c.get("resolved_damage") or 0 for c in hand if c.get("can_play", True))
+            gap = max(0, incoming - block_now)
+            lines.append(
+                f"  本回合：敌人合计 {incoming} 伤 · 现有护甲 {block_now} · 还差 {gap} 点要挡"
+                f" · 手牌能打 {total_dmg} 伤（最高一张 {best_dmg}）"
+            )
         if hand:
             lines.append("  手牌：")
             lines.extend("    " + _fmt_card(c) for c in hand)
@@ -1157,7 +1213,13 @@ def render_state(st: dict, *, pile_limit: int = 8) -> str:
             lines.append(f"  （商店还没准备好：{shop.get('error')}）")
         for it in shop.get("items") or []:
             price = it.get("price", it.get("cost"))
-            name = it.get("card_name") or it.get("relic_name") or it.get("potion_name") or it.get("category")
+            name = (
+                it.get("card_name")
+                or it.get("relic_name")
+                or it.get("potion_name")
+                or it.get("name")
+                or it.get("category")
+            )
             afford = "" if it.get("can_afford", True) else " 买不起"
             lines.append(
                 f"  [{it.get('index')}] {it.get('category')} {name} {price}金{afford}"
@@ -1812,7 +1874,12 @@ class RuleBot:
                 price = _price(it)
                 if price <= 0 or price > gold - 40:
                     continue
-                buy = {"action": "shop_purchase", "index": it.get("index"), "category": "card_removal"}
+                buy = {
+                    "action": "shop_purchase",
+                    "index": it.get("index"),
+                    "native_index": it.get("native_index"),
+                    "category": "card_removal",
+                }
                 break
 
         if buy is not None:
@@ -2182,8 +2249,9 @@ PLAN_SYSTEM = """你在玩《杀戮尖塔 2》(Slay the Spire 2)，用 JSON 给�
 1) 牌名必须和手牌里显示的一模一样（中文就写中文），不要用编号代替名字。
 2) 按顺序执行，别超过手牌张数，也别超过本回合能量能打出的张数。
 3) 计划最后一定要接 {"end_turn": true}。
-4) 算清楚敌人意图：这回合要挡多少、够不够斩杀；先易伤后输出，别为了叠满护甲浪费能量。
-5) 只输出 JSON，第一个字符必须是 {，最后一个是 }，不要输出任何解释文字。
+4) 手牌行末的「→实际N伤 / →实际N挡」和「本回合：…」那行都是引擎算好的真值（已含力量、易伤等），直接用它们算，不要自己再推。
+5) 算清楚敌人意图：这回合要挡多少、够不够斩杀；先易伤后输出，别为了叠满护甲浪费能量。
+6) 只输出 JSON，第一个字符必须是 {，最后一个是 }，不要输出任何解释文字。
 """
 
 

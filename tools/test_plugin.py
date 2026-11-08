@@ -489,7 +489,37 @@ def check_agent_shapes(bot, mod) -> None:
     st = mod.agent_to_legacy(shop_payload)
     act = bot.next_action(st)
     assert act and act["action"] != "shop_purchase", f"买不到的货还去点：{act}"
-    print("✓ 适配层：营火/多选删牌/商店不可售货")
+
+    # 5) 渲染：手牌要带引擎算好的「实际」数值，并给一行本回合算术
+    combat_payload = {
+        "screen": "COMBAT",
+        "in_combat": True,
+        "run": {"act_id": "0", "floor": 5, "character_name": "铁甲战士",
+                "current_hp": 40, "max_hp": 80, "gold": 120, "max_energy": 3},
+        "combat": {
+            "round": 3,
+            "action_readiness": {"can_use_combat_actions": True,
+                                 "player_action_phase": True, "snapshot_stable": True},
+            "end_turn_will_kill_player": False,
+            "player": {"current_hp": 40, "max_hp": 80, "block": 0, "energy": 3,
+                       "powers": [{"name": "力量", "amount": 2}]},
+            "hand": [
+                {"index": 0, "card_id": "STRIKE_IRONCLAD", "name": "打击", "energy_cost": 1,
+                 "playable": True, "requires_target": True, "target_type": "AnyEnemy",
+                 "valid_target_indices": [0], "resolved_rules_text": "造成6点伤害。",
+                 "dynamic_values": [{"name": "Damage", "base_value": 6, "current_value": 8}]},
+            ],
+            "enemies": [{"index": 0, "name": "藤蔓蹒跚者", "current_hp": 61, "max_hp": 61,
+                         "block": 0, "is_alive": True, "powers": [],
+                         "intents": [{"intent_type": "Attack", "label": "6x2", "total_damage": 12}]}],
+        },
+        "available_actions": ["save_and_quit", "play_card", "end_turn"],
+    }
+    text = mod.render_state(mod.agent_to_legacy(combat_payload))
+    assert "→实际8伤" in text, f"手牌没显示引擎算的实际伤害：\n{text}"
+    assert "敌人合计 12 伤" in text, f"没有本回合算术那一行：\n{text}"
+
+    print("✓ 适配层：营火/多选删牌/商店不可售货/实际数值渲染")
 
 
 def _set_hp(payload: dict, hp: int) -> None:
