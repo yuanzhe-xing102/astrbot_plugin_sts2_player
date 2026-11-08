@@ -88,6 +88,58 @@ SCREEN_CN = {
 
 COMBAT_SCREENS = ("monster", "elite", "boss")
 
+# 只在这些界面上问模型。菜单/浮层/结算这种「按钮在哪」的事情规则层一次就对，
+# 交给模型反而会被它编出 menu_select 这种老后端才有的动作。
+LLM_SCREENS = COMBAT_SCREENS + (
+    "map",
+    "rewards",
+    "card_reward",
+    "event",
+    "shop",
+    "fake_merchant",
+    "rest_site",
+    "treasure",
+    "card_select",
+    "bundle_select",
+    "relic_select",
+    "crystal_sphere",
+)
+
+# 每个界面只把这几个动作喂给模型，省 token 也少给幻觉留缝。
+SCREEN_ACTIONS: dict[str, str] = {
+    "monster": "play_card / end_turn / use_potion",
+    "elite": "play_card / end_turn / use_potion",
+    "boss": "play_card / end_turn / use_potion",
+    "map": "choose_map_node",
+    "rewards": "claim_reward / select_card_reward / skip_card_reward / resolve_rewards / proceed",
+    "card_reward": "select_card_reward / skip_card_reward",
+    "event": "choose_event_option / advance_dialogue",
+    "shop": "open_shop / shop_purchase / close_shop / proceed",
+    "fake_merchant": "open_shop / shop_purchase / close_shop / proceed",
+    "rest_site": "choose_rest_option / proceed",
+    "treasure": "open_chest / claim_treasure_relic / proceed",
+    "card_select": "select_card / confirm_selection / cancel_selection",
+    "bundle_select": "select_bundle / confirm_bundle_selection / cancel_bundle_selection",
+    "relic_select": "select_relic / skip_relic_selection",
+    "crystal_sphere": "crystal_sphere_set_tool / crystal_sphere_click_cell / crystal_sphere_proceed",
+}
+
+# 「离开这个界面」在不同后端有不同叫法，按可用性挑一个。
+LEAVE_SUBSTITUTES = (
+    "proceed",
+    "resolve_rewards",
+    "collect_rewards_and_proceed",
+    "close_shop_inventory",
+    "continue_game_over",
+)
+LEAVE_ACTIONS = {
+    "proceed": "proceed",
+    "resolve_rewards": "resolve_rewards",
+    "collect_rewards_and_proceed": "proceed",
+    "close_shop_inventory": "close_shop",
+    "continue_game_over": "continue_game_over",
+}
+
 ACTION_HELP = """动作（POST 到 mod 的 JSON）
   play_card            {"card_index":0,"target":"JAW_WORM_0"}   打一张手牌
   end_turn             {}                                       结束回合
@@ -431,6 +483,11 @@ def agent_to_legacy(d: dict) -> dict:
                 "star_cost": c.get("star_cost"),
                 "description": desc,
                 "target_type": c.get("target_type") or "None",
+                # 真机有种牌 target_type 看着是 None、但 requires_target 是 true
+                # （比如「挑衅」：格挡 + 易伤）。只信 target_type 就会漏传目标，
+                # 引擎回 invalid_target: This card requires target_index.
+                "requires_target": bool(c.get("requires_target")),
+                "valid_target_indices": c.get("valid_target_indices") or [],
                 "can_play": bool(c.get("playable", True)),
                 "unplayable_reason": c.get("unplayable_reason"),
                 "is_upgraded": bool(c.get("upgraded")),
@@ -1360,8 +1417,9 @@ class RuleBot:
                     tgt = self._pick_target(enemies, 0)
                     if self._needs_vulnerable(enemies, tgt):
                         act = {"action": "play_card", "card_index": card.get("index")}
-                        if tgt:
-                            act["target"] = tgt
+                        target = self._target_for(card, enemies, tgt)
+                        if target:
+                            act["target"] = target
                         return act
 
         for card in player.get("hand") or []:
@@ -1381,10 +1439,29 @@ class RuleBot:
         # 分数太低说明打了也没用（比如满护甲还去叠甲），留着能量结束回合
         if best is not None and best[0] >= 1.0:
             act = {"action": "play_card", "card_index": best[1].get("index")}
-            if best[2]:
-                act["target"] = best[2]
+            target = self._target_for(best[1], enemies, best[2])
+            if target:
+                act["target"] = target
             return act
         return {"action": "end_turn"}
+
+    def _target_for(self, card: dict, enemies: list[dict], target: Any = None) -> Any:
+        """这张牌到底要不要带目标。
+
+        真机有牌 target_type 是 None 但 requires_target 为 true（「挑衅」这类），
+        只按 target_type 判断就会漏传，引擎直接 invalid_target 把这一回合废掉。
+        """
+        if target:
+            return target
+        needs = bool(card.get("requires_target")) or str(
+            card.get("target_type") or ""
+        ) in ("AnyEnemy", "AllEnemies")
+        if not needs:
+            return None
+        valid = card.get("valid_target_indices") or []
+        if valid:
+            return str(valid[0])
+        return self._pick_target(enemies, 0)
 
     def _score_card(
         self,
@@ -1509,8 +1586,10 @@ class RuleBot:
 
     def _rewards(self, st: dict) -> dict:
         items = (st.get("rewards") or {}).get("items") or []
-        if items:
-            return {"action": "claim_reward", "index": items[0].get("index")}
+        # 药水槽满时引擎会把药水奖励标成 claimable=false，硬领直接报错。
+        claimable = [it for it in items if it.get("claimable", True)]
+        if claimable:
+            return {"action": "claim_reward", "index": claimable[0].get("index")}
         acts = [str(a) for a in st.get("available_actions") or []]
         if "resolve_rewards" in acts:
             return {"action": "resolve_rewards"}
@@ -2102,13 +2181,24 @@ class Sts2PlayerPlugin(Star):
         await self.client.close()
 
     # ---- LLM 决策 ----
-    async def _ask_llm(self, event: AstrMessageEvent, state_text: str) -> list[dict]:
+    async def _ask_llm(
+        self, event: AstrMessageEvent, state_text: str, stype: str = ""
+    ) -> list[dict]:
         provider = self.context.get_using_provider(event.unified_msg_origin)
         if provider is None:
             raise Sts2Error("没有可用的 LLM Provider，请先在 WebUI 里配置一个。")
         goal = str(self._cfg("goal", "稳一点打，先把这一局玩过关：优先保证不被秒，卡组补强核心输出。"))
+        allowed = SCREEN_ACTIONS.get(stype, "")
+        hint = (
+            f"【本界面只允许这些动作】{allowed}\n"
+            "不要发明别动作；动作名必须原样来自这一行。\n"
+            if allowed
+            else ""
+        )
         prompt = (
             f"【长期目标】{goal}\n"
+            f"【当前界面】{SCREEN_CN.get(stype, stype)}\n"
+            f"{hint}"
             f"【当前场景】\n{state_text}\n\n"
             "请给出接下来的动作。"
         )
@@ -2118,7 +2208,91 @@ class Sts2PlayerPlugin(Star):
         )
         text = getattr(resp, "completion_text", "") or ""
         logger.debug("STS2 LLM 输出：%s", text[:400])
-        return parse_llm_json(text)
+        acts = parse_llm_json(text)
+        if allowed:
+            # 模型偶尔会编出别的后端才有的动作（menu_select 之类），先筛掉，
+            # 全被筛掉就返回空、由规则层接手，而不是拿非法动作去撞三次错误。
+            names = {a.strip() for a in allowed.replace("/", " ").split() if a.strip()}
+            kept = [a for a in acts if str(a.get("action") or "").strip() in names]
+            if len(kept) != len(acts):
+                logger.info(
+                    "STS2 模型给了 %d 个本界面用不了的动作，已丢弃（界面 %s）",
+                    len(acts) - len(kept),
+                    stype,
+                )
+            acts = kept
+        return acts
+
+    def _drop_unavailable(self, st: dict, actions: list[dict]) -> list[dict]:
+        """模型爱在空奖励界面反复 claim_reward。
+
+        引擎每次都把「当前能做什么」写在 available_actions 里，拿它对一遍就能
+        在发出去之前把幻觉动作过滤掉，而不是让它撞三次 invalid_action 把整局停下。
+        """
+        avail = {str(a) for a in (st.get("available_actions") or [])}
+        if not avail:
+            return actions
+        out: list[dict] = []
+        for act in actions:
+            name = str(act.get("action") or "").strip()
+            if name in ("", "wait", "sleep"):
+                out.append(act)
+                continue
+            params = {k: v for k, v in act.items() if k not in ("action", "tool", "think", "reason")}
+            if name == "play_card" and not params.get("target"):
+                # 模型经常忘记给目标；需要目标的牌漏了就直接白给一个合法目标
+                hand = (st.get("player") or {}).get("hand") or []
+                card = next(
+                    (c for c in hand if str(c.get("index")) == str(params.get("card_index"))),
+                    None,
+                )
+                if card is not None:
+                    fixed = self.bot._target_for(
+                        card, (st.get("battle") or {}).get("enemies") or []
+                    )
+                    if fixed:
+                        act["target"] = fixed
+                        params["target"] = fixed
+            if name == "claim_reward":
+                items = (st.get("rewards") or {}).get("items") or []
+                want = next(
+                    (it for it in items if str(it.get("index")) == str(params.get("index"))),
+                    None,
+                )
+                if want is None or not want.get("claimable", True):
+                    logger.info(
+                        "丢掉模型动作 claim_reward %s（这一项领不了：%s）",
+                        params.get("index"),
+                        (want or {}).get("description"),
+                    )
+                    continue
+            try:
+                native, _ = agent_action(name, params)
+            except Exception:  # noqa: BLE001
+                native = name
+            native = native or name
+            # proceed 在不同后端可能叫 resolve_rewards / collect_rewards_and_proceed /
+            # close_shop_inventory。但如果当前界面一个都不给（比如钱不够的商店只剩
+            # close_shop_inventory），模型硬发 proceed 就是三次 invalid_action 收场。
+            if name in ("proceed", "resolve_rewards"):
+                if native in avail:
+                    out.append(act)
+                    continue
+                sub = next(
+                    (s for s in LEAVE_SUBSTITUTES if s in avail),
+                    None,
+                )
+                if sub:
+                    act = {"action": LEAVE_ACTIONS[sub]}
+                    out.append(act)
+                else:
+                    logger.info("丢掉模型动作 %s（当前可用：%s）", native, ",".join(sorted(avail))[:160])
+                continue
+            if native in avail:
+                out.append(act)
+            else:
+                logger.info("丢掉模型动作 %s（当前可用：%s）", native, ",".join(sorted(avail))[:160])
+        return out
 
     # ---- 自动推进 ----
     async def _restart(self, event: AstrMessageEvent) -> bool:
@@ -2230,12 +2404,20 @@ class Sts2PlayerPlugin(Star):
 
                 text = render_state(st)
                 actions: list[dict] = []
-                if use_llm and (llm_combat or stype not in COMBAT_SCREENS):
+                ask_model = (
+                    use_llm
+                    and (llm_combat or stype not in COMBAT_SCREENS)
+                    and stype in LLM_SCREENS
+                )
+                if ask_model:
                     try:
-                        actions = await self._ask_llm(event, text)
+                        actions = await self._ask_llm(event, text, stype)
                     except Exception as e:  # noqa: BLE001 —— 模型挂了就退回规则层
                         logger.warning("STS2 LLM 决策失败，回退规则层：%s", e)
                         actions = []
+
+                if actions:
+                    actions = self._drop_unavailable(st, actions)
 
                 if not actions:
                     one = self.bot.next_action(st)

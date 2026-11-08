@@ -12,3 +12,7 @@ dist/
 probe_*.log
 rest_raw*.json
 run_*.log
+
+# 临时调试脚本与日志
+_dbg*.py
+mock_err.log

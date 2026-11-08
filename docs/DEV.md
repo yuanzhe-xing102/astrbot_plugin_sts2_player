@@ -173,6 +173,13 @@ WebUI → 插件 → `astrbot_plugin_sts2_player`：
   `_PluginUpdater.validate_plugin_archive` 做校验
 - `make_logo.py`：生成插件列表用的 `logo.png`
 - `live_agent.py`：早期的独立极简驱动（只用来验证接口，逻辑比插件本体简陋）
+- `live_llm.py`：**让模型真打**。把插件的 `_ask_llm` 接到 DeepSeek（读 `core/data/cmd_config.json`
+  里现成的 key，或用 `STS2_LLM_KEY`/`STS2_LLM_BASE`/`STS2_LLM_MODEL`），走的就是插件的
+  `render_state` → `LLM_SYSTEM` → `parse_llm_json` → `_auto` 那条路；`--llm-combat` 连战斗也交给模型。
+  结束时打印调用次数与 token 用量。实测：默认模式真机第 14 层（80 次调用 / 70.6k tokens），
+  `--llm-combat` 第 5 层——战斗那几回合的取舍模型算不过启发式
+- `probe_screen.py` / `probe_smith.py`：跑到指定原生界面就停，把**原生 payload** 和**映射后的
+  legacy 状态**一起打出来，用来对照引擎字段和我们的适配层
 
 用 AstrBot 实例自带的 venv 跑（不需要额外装包）：
 

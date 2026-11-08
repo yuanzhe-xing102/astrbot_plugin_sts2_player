@@ -65,6 +65,33 @@ LLM 工具：`sts2_state`（读状态）、`sts2_action`（下动作），主模
 3. 注意 `STS2-Agent` 声明了 `min_game_version`（0.17.0 要求 `0.111.0`），游戏版本太老会拒绝加载
 4. 老的 `STS2_MCP`（15526）也能用，但只支持较旧的游戏版本
 
+## 模型介入实测（use_llm / llm_combat）
+
+`tools/live_llm.py` 会把插件的 `_ask_llm` 真接上 DeepSeek（走插件自己的代码路径：
+`render_state` → `LLM_SYSTEM` → `parse_llm_json` → `_auto` 执行），用 `deepseek-chat` 实跑：
+
+| 模式 | 真机最好成绩 | 模型调用 | tokens | 大约花费 |
+|---|---|---|---|---|
+| 默认（战斗交规则层） | 第 14 层 | 80 次 / 260 步 | 70.6k | ≈¥0.08 |
+| 默认，另一局 | 第 14 层 | 50 次 / 150 步 | 42.0k | ≈¥0.05 |
+| 全部交给模型（`--llm-combat`） | 第 5 层 | 45 次 / 200 步 | 49.9k | ≈¥0.06 |
+| 规则层（对照） | 第 15~17 层 | 0 次 | 0 | ¥0 |
+
+对比规则层（同一台机器、同一版本）：真机第 15~17 层，**0 token**。
+结论：模型能打，但没有比规则层更好，而且贵两个数量级；一旦把战斗也交给它
+（`--llm-combat`）成绩反而掉到第 5 层——回合内的取舍它算不过那几条启发式。
+它的价值在于「遇到没见过的事件/商店时不会瞎点」，而不是替掉规则层。
+
+模型暴露的典型毛病（都已加护栏，日志里能看到护栏触发）：
+
+- 奖励已经领完还在发 `claim_reward index 0` → 现在按 `available_actions` 和
+  `claimable` 过滤掉，改由规则层收尾
+- 药水槽满时硬领药水奖励（`All potion slots are full`）→ 同上
+- 需要目标的牌忘了带 `target`（`This card requires target_index`）→ 现在按
+  `requires_target` / `valid_target_indices` 自动补一个合法目标
+- 在自己不负责的界面（菜单、水晶球）乱发动作 → 按界面白名单 `SCREEN_ACTIONS`
+  只喂它能用的动作
+
 ## 已知限制
 
 - 规则层打不过第 1 幕 Boss 很正常：它只会「先易伤再输出」这一种连招，
