@@ -16,3 +16,6 @@ run_*.log
 # 临时调试脚本与日志
 _dbg*.py
 mock_err.log
+
+# 本地推送脚本（含重试逻辑，不属于插件）
+push_retry.ps1
