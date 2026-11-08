@@ -74,11 +74,13 @@ def read_llm_config() -> tuple[str, str, str]:
 class DeepSeekProvider:
     """只实现插件用到的那一个方法：text_chat(prompt=, system_prompt=)。"""
 
-    def __init__(self, key: str, base: str, model: str, timeout: float = 120.0):
+    def __init__(self, key: str, base: str, model: str, timeout: float = 120.0,
+                 max_tokens: int = 700):
         self.key = key
         self.base = base.rstrip("/")
         self.model = model
         self.timeout = timeout
+        self.max_tokens = max_tokens
         self.calls = 0
         self.prompt_tokens = 0
         self.completion_tokens = 0
@@ -99,9 +101,11 @@ class DeepSeekProvider:
                 {"role": "user", "content": prompt},
             ],
             "temperature": 0.2,
-            "max_tokens": 400,
+            "max_tokens": int(kw.get("max_tokens") or self.max_tokens),
             "stream": False,
         }
+        if kw.get("thinking_disabled", True):
+            payload["thinking"] = {"type": "disabled"}
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.key}"}
         text = ""
         try:
@@ -120,7 +124,11 @@ class DeepSeekProvider:
             usage = data.get("usage") or {}
             self.prompt_tokens += int(usage.get("prompt_tokens") or 0)
             self.completion_tokens += int(usage.get("completion_tokens") or 0)
-            text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+            msg = ((data.get("choices") or [{}])[0].get("message") or {})
+            text = msg.get("content") or ""
+            if not text.strip():
+                # 有些模型把全部输出放进 reasoning_content，content 为空
+                text = msg.get("reasoning_content") or ""
             self.last_text = text
         except Exception as e:  # noqa: BLE001
             self.errors += 1
@@ -198,6 +206,7 @@ async def run(args) -> int:
         "report_every": args.report_every,
         "use_llm": True,
         "llm_combat": bool(args.llm_combat),
+        "llm_combat_plan": bool(args.plan),
         "potion_hp_ratio": args.potion,
         "block_priority": args.bp,
         "card_min": args.pick,
@@ -274,6 +283,7 @@ def main() -> int:
     p.add_argument("--bp", type=float, default=0.15)
     p.add_argument("--pick", type=float, default=18.0)
     p.add_argument("--llm-combat", action="store_true", help="战斗动作也交给模型决定")
+    p.add_argument("--plan", action="store_true", help="回合计划模式：每回合只问一次，模型给整串出牌顺序")
     p.add_argument("--start-run", action="store_true")
     p.add_argument("--no-auto-restart", action="store_true")
     p.add_argument("--verbose", action="store_true")

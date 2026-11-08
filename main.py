@@ -1259,6 +1259,71 @@ class RuleBot:
         self._sel_count = 0
         self._sel_picked: set = set()
         self._sel_confirmed = False
+        # 模型给的「这一回合怎么打」计划；规则层负责逐步执行与校验
+        self.plan: list[dict] = []
+        self._plan_key: Any = None
+
+    # -- 回合计划：模型只出计划，由规则层逐步执行 --
+    def set_plan(self, steps: list[dict], st: dict) -> int:
+        """装进一份计划，记下它属于哪一回合（换回合/换战斗自动作废）。"""
+        battle = st.get("battle") or {}
+        self._plan_key = (str(st.get("state_type") or ""), battle.get("round"))
+        self.plan = [s for s in steps if isinstance(s, dict)][:8]
+        return len(self.plan)
+
+    def clear_plan(self) -> None:
+        self.plan = []
+        self._plan_key = None
+
+    def _take_plan(self, st: dict) -> dict | None:
+        """从计划里取下一步并校验；计划失效就丢掉，交回启发式。"""
+        if not self.plan:
+            return None
+        battle = st.get("battle") or {}
+        key = (str(st.get("state_type") or ""), battle.get("round"))
+        if self._plan_key != key:
+            self.clear_plan()
+            return None
+
+        player = st.get("player") or {}
+        hand = [c for c in (player.get("hand") or []) if c.get("index") is not None]
+        energy = int(player.get("energy") or 0)
+        enemies = [e for e in (battle.get("enemies") or []) if (e.get("hp") or 0) > 0]
+
+        step = self.plan.pop(0)
+        if step.get("end_turn") or step.get("action") == "end_turn":
+            self.clear_plan()
+            return {"action": "end_turn"}
+
+        # 计划里用「牌名」而不是 index —— 出一张牌之后剩下的牌会左移，index 早就废了
+        name = str(step.get("card") or step.get("name") or "").strip()
+        card = None
+        if name:
+            for c in hand:
+                if (
+                    str(c.get("name") or "").strip() == name
+                    and c.get("can_play") is not False
+                    and _cost(c) <= energy
+                ):
+                    card = c
+                    break
+        else:
+            idx = step.get("card_index")
+            card = next((c for c in hand if str(c.get("index")) == str(idx)), None)
+            if card is not None and (card.get("can_play") is False or _cost(card) > energy):
+                card = None
+        if card is None:
+            logger.info("计划里的「%s」现在打不出去，丢掉剩下的计划", name or step.get("card_index"))
+            self.clear_plan()
+            return None
+
+        act = {"action": "play_card", "card_index": card.get("index")}
+        target = self._target_for(card, enemies, step.get("target"))
+        if target:
+            act["target"] = str(target)
+        if not self.plan:
+            self.clear_plan()
+        return act
 
     # -- 入口：把 state_type 分发到具体处理器 --
     def next_action(self, st: dict) -> dict | None:
@@ -1337,6 +1402,11 @@ class RuleBot:
         need = max(0, incoming - block)
         hp = float(player.get("hp") or 0)
         max_hp = float(player.get("max_hp") or 1)
+
+        # 模型给了这一回合的计划就照着打（每步都重新校验）
+        step = self._take_plan(st)
+        if step is not None:
+            return step
 
         # 快死了就喝药；精英/Boss 战更早喝，省着不用等于没带
         hard = str(st.get("state_type") or "") in ("elite", "boss")
@@ -2103,6 +2173,74 @@ LLM_SYSTEM = """你在玩《杀戮尖塔 2》(Slay the Spire 2)，用 JSON 指�
 """ + ACTION_HELP
 
 
+PLAN_SYSTEM = """你在玩《杀戮尖塔 2》(Slay the Spire 2)，用 JSON 给出「本回合出牌计划」。
+
+只输出一个 JSON 对象，不要解释，不要代码块，不要写思考过程：
+{"think": "一句话思路", "plan": [{"card": "牌名"}, {"card": "牌名", "target": 0}, {"end_turn": true}]}
+
+规则：
+1) 牌名必须和手牌里显示的一模一样（中文就写中文），不要用编号代替名字。
+2) 按顺序执行，别超过手牌张数，也别超过本回合能量能打出的张数。
+3) 计划最后一定要接 {"end_turn": true}。
+4) 算清楚敌人意图：这回合要挡多少、够不够斩杀；先易伤后输出，别为了叠满护甲浪费能量。
+5) 只输出 JSON，第一个字符必须是 {，最后一个是 }，不要输出任何解释文字。
+"""
+
+
+def parse_plan_json(text: str) -> list[dict]:
+    """抠出「回合计划」：一个按顺序执行的动作数组。
+
+    模型的写法很花：plan / actions / steps、元素是 {"card":..} 或
+    {"action":"play_card","card_index":2} 或纯牌名字符串，都得能认。
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    cands = [raw]
+    cands += [m.strip() for m in re.findall(r"```(?:json)?\s*(.*?)```", raw, re.S)]
+    first, last = raw.find("{"), raw.rfind("}")
+    if 0 <= first < last:
+        cands.append(raw[first : last + 1])
+
+    for cand in cands:
+        try:
+            obj = json.loads(cand)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, list):
+            obj = {"plan": obj}
+        if not isinstance(obj, dict):
+            continue
+        steps = obj.get("plan") or obj.get("actions") or obj.get("steps")
+        if not isinstance(steps, list):
+            continue
+        out: list[dict] = []
+        for s in steps:
+            if isinstance(s, str) and s.strip():
+                if s.strip().lower() in ("end_turn", "end turn", "结束回合"):
+                    out.append({"end_turn": True})
+                else:
+                    out.append({"card": s.strip()})
+            elif isinstance(s, dict):
+                if s.get("end_turn") or str(s.get("action") or "").lower() in ("end_turn", "结束回合"):
+                    out.append({"end_turn": True})
+                    continue
+                name = s.get("card") or s.get("name") or s.get("card_name")
+                step: dict[str, Any] = {}
+                if name:
+                    step["card"] = str(name).strip()
+                elif s.get("card_index") is not None:
+                    step["card_index"] = s.get("card_index")
+                else:
+                    continue
+                if s.get("target") is not None:
+                    step["target"] = s.get("target")
+                out.append(step)
+        if out:
+            return out[:8]
+    return []
+
+
 def parse_llm_json(text: str) -> list[dict]:
     """从模型输出里抠出 actions。宽容：代码块 / 前后废话 / 单动作对象。"""
     raw = (text or "").strip()
@@ -2182,7 +2320,7 @@ class Sts2PlayerPlugin(Star):
 
     # ---- LLM 决策 ----
     async def _ask_llm(
-        self, event: AstrMessageEvent, state_text: str, stype: str = ""
+        self, event: AstrMessageEvent, state_text: str, stype: str = "", plan: bool = False
     ) -> list[dict]:
         provider = self.context.get_using_provider(event.unified_msg_origin)
         if provider is None:
@@ -2195,19 +2333,51 @@ class Sts2PlayerPlugin(Star):
             if allowed
             else ""
         )
-        prompt = (
-            f"【长期目标】{goal}\n"
-            f"【当前界面】{SCREEN_CN.get(stype, stype)}\n"
-            f"{hint}"
-            f"【当前场景】\n{state_text}\n\n"
-            "请给出接下来的动作。"
-        )
+        if plan:
+            prompt = (
+                f"【长期目标】{goal}\n"
+                f"【当前界面】{SCREEN_CN.get(stype, stype)}\n"
+                f"【当前场景】\n{state_text}\n\n"
+                "这是你的整个回合。请一次性给出**按顺序执行**的出牌计划，不要只给一步。\n"
+                "格式：{\"think\":\"一句话思路\",\"plan\":[{\"card\":\"牌名\"},{\"card\":\"牌名\",\"target\":0},{\"end_turn\":true}]}\n"
+                "规则：\n"
+                "1. 牌名必须和手牌里显示的一模一样（中文就写中文）\n"
+                "2. 计划别超过手牌张数，也别超过能量能打出的张数\n"
+                "3. 打完了要接一条 {\"end_turn\":true}\n"
+                "4. 算清楚敌人意图：这回合要挡多少、够不够斩杀，再决定顺序（先易伤后输出，别浪费能量叠满护甲）"
+            )
+        else:
+            prompt = (
+                f"【长期目标】{goal}\n"
+                f"【当前界面】{SCREEN_CN.get(stype, stype)}\n"
+                f"{hint}"
+                f"【当前场景】\n{state_text}\n\n"
+                "请给出接下来的动作。"
+            )
+        sys_prompt = str(self._cfg("llm_system_prompt", LLM_SYSTEM))
+        if plan:
+            sys_prompt = str(self._cfg("llm_plan_system_prompt", PLAN_SYSTEM))
         resp = await provider.text_chat(
             prompt=prompt,
-            system_prompt=str(self._cfg("llm_system_prompt", LLM_SYSTEM)),
+            system_prompt=sys_prompt,
+            **({"max_tokens": int(self._cfg("llm_max_tokens", 800))} if plan else {}),
         )
         text = getattr(resp, "completion_text", "") or ""
         logger.debug("STS2 LLM 输出：%s", text[:400])
+        if plan:
+            steps = parse_plan_json(text)
+            if steps:
+                logger.info(
+                    "STS2 模型给出回合计划 %d 步：%s",
+                    len(steps),
+                    " → ".join(
+                        str(s.get("card") or s.get("card_index") or ("结束回合" if s.get("end_turn") else s))
+                        for s in steps
+                    ),
+                )
+            else:
+                logger.info("STS2 模型没给出可用的回合计划，原文：%s", (text or "")[:200].replace("\n", " "))
+            return steps
         acts = parse_llm_json(text)
         if allowed:
             # 模型偶尔会编出别的后端才有的动作（menu_select 之类），先筛掉，
@@ -2337,6 +2507,7 @@ class Sts2PlayerPlugin(Star):
         report_every = max(1, int(self._cfg("report_every", 5)))
         use_llm = bool(self._cfg("use_llm", False))
         llm_combat = bool(self._cfg("llm_combat", False))
+        plan_mode = bool(self._cfg("llm_combat_plan", False))
         auto_restart = bool(self._cfg("auto_restart", True))
         restarts = 0
 
@@ -2351,6 +2522,7 @@ class Sts2PlayerPlugin(Star):
         try:
             i = 0
             waits = 0
+            plan_asked: tuple | None = None
             while i < steps:
                 if umo in self._stop:
                     yield event.plain_result(f"已停止（第 {i} 步）。")
@@ -2406,9 +2578,30 @@ class Sts2PlayerPlugin(Star):
                 actions: list[dict] = []
                 ask_model = (
                     use_llm
-                    and (llm_combat or stype not in COMBAT_SCREENS)
                     and stype in LLM_SCREENS
+                    and (
+                        stype not in COMBAT_SCREENS
+                        or (llm_combat and not plan_mode)
+                    )
                 )
+                # 回合计划模式：战斗里一回合只问一次模型，让它给整串出牌顺序，
+                # 规则层负责按牌名逐步执行并在出意外时接手（省 token 也更像人）。
+                if (
+                    use_llm
+                    and plan_mode
+                    and stype in COMBAT_SCREENS
+                    and (st.get("battle") or {}).get("is_play_phase")
+                ):
+                    turn_key = (stype, (st.get("battle") or {}).get("round"))
+                    if not self.bot.plan and plan_asked != turn_key:
+                        plan_asked = turn_key
+                        try:
+                            plan_steps = await self._ask_llm(event, text, stype, plan=True)
+                        except Exception as e:  # noqa: BLE001
+                            logger.warning("STS2 回合计划失败，回退规则层：%s", e)
+                            plan_steps = []
+                        if plan_steps:
+                            self.bot.set_plan(plan_steps, st)
                 if ask_model:
                     try:
                         actions = await self._ask_llm(event, text, stype)

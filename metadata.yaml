@@ -1,8 +1,8 @@
 name: astrbot_plugin_sts2_player
 display_name: 杀戮尖塔 2 自动打牌
 short_desc: 让 AI 自己打《杀戮尖塔 2》：读引擎真值、规则层出牌与卡组构筑，零 token 战斗
-desc: 让 AI 玩《杀戮尖塔 2》：通过游戏 mod 的本地 HTTP 接口读取引擎真值，规则机器人负责战斗与卡组构筑（选牌/升级/删牌），可选让 LLM 决策选牌/事件/路线。支持 STS2-Agent 与 STS2_MCP 两种后端。
-version: v0.4.5
+desc: 让 AI 玩《杀戮尖塔 2》：通过游戏 mod 的本地 HTTP 接口读取引擎真值，规则机器人负责战斗与卡组构筑（选牌/升级/删牌），可选让 LLM 决策选牌/事件/路线，也能让模型按回合给整串出牌计划。支持 STS2-Agent 与 STS2_MCP 两种后端。
+version: v0.4.6
 author: yuanzhe-xing102
 repo: "https://github.com/yuanzhe-xing102/astrbot_plugin_sts2_player"
 social_link: "https://github.com/yuanzhe-xing102"

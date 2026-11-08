@@ -39,6 +39,11 @@
     "type": "bool",
     "default": false
   },
+  "llm_combat_plan": {
+    "description": "回合计划模式：每个我方回合只问一次模型，让它给整串出牌顺序，规则层按牌名执行并在意外时接手（比逐张问便宜，也比纯规则会算连招）",
+    "type": "bool",
+    "default": false
+  },
   "potion_hp_ratio": {
     "description": "血量低于这个比例时规则机器人会喝药",
     "type": "float",

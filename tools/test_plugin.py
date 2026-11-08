@@ -162,6 +162,8 @@ async def main() -> int:
     check_vuln_order(plugin.bot)
     # ---- 适配层：STS2-Agent 的原生 payload 要能映射成规则层认识的形状 ----
     check_agent_shapes(plugin.bot, mod)
+    # ---- 回合计划：模型给顺序、规则层执行，失效要能退回启发式 ----
+    check_plan_mode(plugin.bot, mod)
 
     await plugin.client.close()
     server.shutdown()
@@ -318,6 +320,56 @@ def check_vuln_order(bot) -> None:
     act = bot.next_action(combat_state([bash, strike, strike], energy=3, enemy_hp=12))
     assert act and act["action"] == "play_card" and act["card_index"] != 0, f"能斩杀却先挂易伤：{act}"
     print("✓ 连招：能斩杀时优先斩杀")
+
+
+def check_plan_mode(bot, mod) -> None:
+    """回合计划：模型只给顺序，规则层负责执行与失效兜底。"""
+    strike = card("打击", "Attack", "1", "造成6点伤害。")
+    strike["target_type"] = "AnyEnemy"
+    defend = card("防御", "Skill", "1", "获得5点格挡。")
+
+    def st(round_no=1, energy=3, hand=None):
+        return {
+            "state_type": "monster",
+            "player": {"hp": 70, "max_hp": 80, "block": 0, "energy": energy,
+                       "hand": indexed(hand if hand is not None else [strike, defend]), "potions": []},
+            "battle": {"round": round_no, "turn": "player", "is_play_phase": True,
+                       "enemies": [{"entity_id": "0", "name": "小怪", "hp": 50, "max_hp": 50,
+                                    "block": 0, "status": [],
+                                    "intents": [{"type": "Attack", "label": "10", "description": ""}]}]},
+        }
+
+    # 1) 解析：模型的花样写法都要认（plan/actions、牌名、end_turn 字符串）
+    steps = mod.parse_plan_json('```json\n{"think":"先打再防","plan":[{"card":"打击"},{"card":"防御","target":0},{"end_turn":true}]}\n```')
+    assert [s.get("card") for s in steps[:2]] == ["打击", "防御"], f"计划没解析对：{steps}"
+    assert steps[-1].get("end_turn") is True, f"end_turn 没解析出来：{steps}"
+    assert mod.parse_plan_json('{"actions":["打击","end_turn"]}')[0]["card"] == "打击"
+    print("✓ 计划：三种写法都能解析")
+
+    # 2) 执行：按名字依次出手，且自动补齐合法目标
+    bot.clear_plan()
+    bot.set_plan([{"card": "打击", "target": 0}, {"card": "防御"}, {"end_turn": True}], st())
+    a1 = bot.next_action(st())
+    assert a1["action"] == "play_card" and a1["card_index"] == 0 and a1.get("target") == "0", f"第一步不对：{a1}"
+    a2 = bot.next_action(st(hand=[defend]))          # 打击已经打出去了，手牌只剩防御
+    assert a2["action"] == "play_card" and a2["card_index"] == 0, f"第二步不对：{a2}"
+    a3 = bot.next_action(st(hand=[defend]))
+    assert a3["action"] == "end_turn", f"第三步该结束回合：{a3}"
+    print("✓ 计划：按顺序执行，出牌后按名字重新定位")
+
+    # 3) 计划里的牌打不出去（没能量/没这张牌）→ 丢掉计划，退回启发式
+    bot.clear_plan()
+    bot.set_plan([{"card": "痛击"}], st())          # 手上没有痛击
+    fallback = bot.next_action(st())
+    assert fallback["action"] != "wait" and not bot.plan, f"失效计划没被丢掉：{fallback}"
+    print("✓ 计划：失效就丢掉、交回规则层")
+
+    # 4) 换回合 → 上一回合的计划自动作废
+    bot.clear_plan()
+    bot.set_plan([{"card": "打击"}, {"card": "打击"}], st(round_no=1))
+    act = bot.next_action(st(round_no=2))
+    assert not bot.plan, "跨回合的计划没作废"
+    print("✓ 计划：换回合自动作废")
 
 
 def check_agent_shapes(bot, mod) -> None:
