@@ -158,6 +158,8 @@ async def main() -> int:
 
     # ---- 卡组构筑层：选牌/升级/删牌都要看整副牌，而不是只看单卡 ----
     check_deck_sense(plugin.bot)
+    # ---- 构筑层流派：认出一副牌在攒什么，然后往同一个方向补牌 ----
+    check_archetype(plugin.bot, mod)
     # ---- 连招层：能挂易伤就先挂，后面的攻击牌全部 +50% ----
     check_vuln_order(plugin.bot)
     # ---- 适配层：STS2-Agent 的原生 payload 要能映射成规则层认识的形状 ----
@@ -283,6 +285,56 @@ def check_deck_sense(bot) -> None:
     act = bot.next_action(shop)
     assert act and act.get("category") == "card_removal", f"牌组厚了没买删牌：{act}"
     print("✓ 商店：牌组厚时买删牌服务")
+
+
+def check_archetype(bot, mod) -> None:
+    """流派化构筑：牌组在攒力量就该拿多段攻击，在攒消耗就该拿「每当消耗」的回报牌。"""
+    def power(name, desc, rarity="Uncommon"):
+        return card(name, "Power", "1", desc, rarity)
+
+    # 1) 力量流：两张叠力量的牌 → 认成 strength，多段攻击优先于同等伤害的单段
+    deck = deck_of(6, 3, [power("力量爆发", "获得2点力量。"), power("力量爆发", "获得2点力量。")])
+    prof = mod._deck_profile(deck)
+    assert prof["archetype"] == "strength", f"没认出力量流：{prof}"
+
+    st = {
+        "state_type": "card_reward",
+        "player": {"deck": deck, "hp": 80, "max_hp": 80},
+        "card_reward": {
+            "can_skip": True,
+            "cards": indexed([
+                card("连续打击", "Attack", "2", "造成6点伤害两次。"),
+                card("重击", "Attack", "2", "造成12点伤害。"),
+            ]),
+        },
+    }
+    act = bot.next_action(st)
+    assert act == {"action": "select_card_reward", "card_index": 0}, f"力量流没偏好多段攻击：{act}"
+    print("✓ 流派：力量流偏好多段攻击")
+
+    # 2) 消耗流：三张消耗牌 → 认成 exhaust，「每当消耗」的回报牌优先
+    deck = deck_of(5, 4, [
+        card("燃烧", "Skill", "1", "消耗。造成8点伤害。"),
+        card("祭品", "Skill", "1", "消耗。抽2张牌。"),
+        card("清理", "Skill", "1", "消耗。获得3点格挡。"),
+    ])
+    prof = mod._deck_profile(deck)
+    assert prof["archetype"] == "exhaust", f"没认出消耗流：{prof}"
+
+    st["player"]["deck"] = deck
+    st["card_reward"]["cards"] = indexed([
+        power("黑暗之拥", "每当你消耗一张牌，获得2点力量。"),
+        power("力量爆发", "获得2点力量。"),
+    ])
+    act = bot.next_action(st)
+    assert act == {"action": "select_card_reward", "card_index": 0}, f"消耗流没偏好回报牌：{act}"
+    print("✓ 流派：消耗流偏好「每当消耗」回报牌")
+
+    # 3) 普通牌组：没有流派，加成必须是 0（保持旧的「缺什么补什么」行为）
+    prof = mod._deck_profile(deck_of(8, 4))
+    assert prof["archetype"] == "", f"普通牌组被硬认成流派：{prof}"
+    assert mod._archetype_bonus(card("重击", "Attack", "2", "造成14点伤害。"), prof) == 0.0, "无流派还在加流派分"
+    print("✓ 流派：普通牌组不受影响")
 
 
 def check_vuln_order(bot) -> None:

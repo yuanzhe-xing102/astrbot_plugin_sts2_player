@@ -1945,12 +1945,12 @@ class RuleBot:
             self._sel_confirmed = True
             return {"action": "confirm_selection"}
         # 真机上「删牌」和「事件选牌」都用 deck_card_select 这个 kind，只能靠提示语区分
+        prof = _deck_profile((st.get("player") or {}).get("deck"))
         if "upgrade" in kind or "升级" in prompt:
-            order = sorted(cards, key=_upgrade_value, reverse=True)
+            order = sorted(cards, key=lambda c: _upgrade_value(c, prof), reverse=True)
         elif "remove" in kind or "移除" in prompt or "删" in prompt:
-            order = sorted(cards, key=lambda c: _card_strength(c))
+            order = sorted(cards, key=lambda c: _card_strength(c, prof))
         else:
-            prof = _deck_profile((st.get("player") or {}).get("deck"))
             order = sorted(cards, key=lambda c: _deck_fit(c, prof), reverse=True)
         # 每一步都重读状态，所以「点过哪些」只用来跳过已经选中的牌；
         # 同一张牌重复点会被原生界面当成又一次点击（状态不变），必须换下一张。
@@ -2061,6 +2061,7 @@ def _deck_profile(deck: list[dict] | None) -> dict[str, Any]:
         return prof
     atk = blk = pwr = up = curse = 0
     vuln = exhaust = 0
+    strength = multi = draw = energy = 0
     names: dict[str, int] = {}
     for c in cards:
         desc = str(c.get("description") or "")
@@ -2081,6 +2082,15 @@ def _deck_profile(deck: list[dict] | None) -> dict[str, Any]:
             vuln += 1
         if "消耗" in desc or "exhaust" in low:
             exhaust += 1
+        # 流派素材：力量、多段、抽牌、加能量——决定这副牌往哪条路走
+        if "力量" in desc or "strength" in low:
+            strength += 1
+        if _card_hits(desc) >= 2 or "次" in desc or "times" in low:
+            multi += 1
+        if "抽" in desc or "draw" in low:
+            draw += 1
+        if "能量" in desc or "energy" in low:
+            energy += 1
         name = str(c.get("name") or "")
         if name:
             names[name] = names.get(name, 0) + 1
@@ -2093,10 +2103,84 @@ def _deck_profile(deck: list[dict] | None) -> dict[str, Any]:
             "curse_ratio": curse / size,
             "vuln": float(vuln),
             "exhaust": float(exhaust),
+            "strength": float(strength),
+            "multi": float(multi),
+            "draw": float(draw),
+            "energy": float(energy),
             "names": names,
         }
     )
+    prof["archetype"] = _deck_archetype(prof)
     return prof
+
+
+def _deck_archetype(prof: dict[str, Any] | None) -> str:
+    """这副牌现在最像哪条流派：力量 / 消耗 / 易伤 / 能力堆叠。只认「已经有两个以上素材」的。"""
+    if not prof:
+        return ""
+    if float(prof.get("strength") or 0) >= 2:
+        return "strength"
+    if float(prof.get("exhaust") or 0) >= 3:
+        return "exhaust"
+    if float(prof.get("vuln") or 0) >= 2:
+        return "vuln"
+    if float(prof.get("powers") or 0) >= 3:
+        return "powers"
+    return ""
+
+
+def _card_hits(desc: str) -> int:
+    """这张牌打几段（「造成6点伤害两次」→2）。"""
+    low = str(desc or "").lower()
+    m = re.search(r"(\d+)\s*(?:times|hits|次)", low)
+    if m:
+        return max(1, int(m.group(1)))
+    if "twice" in low or "两次" in low:
+        return 2
+    if "thrice" in low or "三次" in low:
+        return 3
+    return 1
+
+
+def _archetype_bonus(card: dict, prof: dict[str, Any] | None) -> float:
+    """按流派给这张牌加减分。流派不明的牌组返回 0（保持旧的「缺什么补什么」）。"""
+    arch = str((prof or {}).get("archetype") or "")
+    if not arch:
+        return 0.0
+    desc = str(card.get("description") or "")
+    low = desc.lower()
+    ctype = str(card.get("type") or "")
+    hits = _card_hits(desc)
+
+    if arch == "strength":
+        # 力量流吃「每段都加力量」的多段攻击，以及继续叠力量的牌
+        if hits >= 2:
+            return 8.0
+        if "力量" in desc or "strength" in low:
+            return 7.0
+        if ctype == "Attack":
+            return 1.0
+        return -3.0
+    if arch == "exhaust":
+        # 消耗流吃「消耗」本身和「每当消耗时……」的回报牌
+        if "每当" in desc and ("消耗" in desc or "exhaust" in low):
+            return 9.0
+        if "消耗" in desc or "exhaust" in low:
+            return 6.0
+        return -2.0
+    if arch == "vuln":
+        if "易伤" in desc or "vulnerable" in low:
+            return 7.0
+        if hits >= 2:
+            return 4.0
+        if ctype == "Attack":
+            return 1.0
+        return -2.0
+    if arch == "powers":
+        if ctype == "Power":
+            return 5.0
+        return -1.0
+    return 0.0
 
 
 def _deck_fit(card: dict, prof: dict[str, Any] | None) -> float:
@@ -2144,10 +2228,12 @@ def _deck_fit(card: dict, prof: dict[str, Any] | None) -> float:
     same = int((prof.get("names") or {}).get(str(card.get("name") or ""), 0))
     if same >= 2:
         score -= 5.0 * (same - 1)
+    # 流派方向：已经攒出套路的牌组，新牌要往同一个方向使劲
+    score += _archetype_bonus(card, prof)
     return score
 
 
-def _upgrade_value(card: dict) -> float:
+def _upgrade_value(card: dict, prof: dict[str, Any] | None = None) -> float:
     """哪张牌最值得升级：优先上易伤/核心能力，其次看每点能量的收益。"""
     if card.get("is_upgraded"):
         return -1e9
@@ -2165,10 +2251,12 @@ def _upgrade_value(card: dict) -> float:
         score += 8.0
     if "抽" in desc or "draw" in low:
         score += 3.0
+    # 升级该跟着流派走：力量流升多段，消耗流升「消耗」引擎
+    score += _archetype_bonus(card, prof) * 0.5
     return score
 
 
-def _card_strength(card: dict) -> float:
+def _card_strength(card: dict, prof: dict[str, Any] | None = None) -> float:
     """一张牌的大致战斗力，删牌时挑最弱的。"""
     desc = str(card.get("description") or "")
     val = _card_damage(desc) * 1.2 + _card_block(desc) * 1.0
@@ -2177,14 +2265,16 @@ def _card_strength(card: dict) -> float:
         val += 12.0
     if ctype == "Curse":
         val -= 30.0
+    # 跟流派对着干的牌，删起来更划算
+    val += _archetype_bonus(card, prof) * 0.8
     return val
 
 
-def _worst_card(cards: list[dict]) -> dict | None:
+def _worst_card(cards: list[dict], prof: dict[str, Any] | None = None) -> dict | None:
     """删牌目标：基础打击/防御最该删，其次是纯数值低的牌。"""
     if not cards:
         return None
-    return min(cards, key=_card_strength)
+    return min(cards, key=lambda c: _card_strength(c, prof))
 
 
 def _event_option_score(opt: dict, hp_ratio: float, gold: int) -> float:
