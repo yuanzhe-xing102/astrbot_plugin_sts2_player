@@ -2143,10 +2143,10 @@ def _card_hits(desc: str) -> int:
 
 
 def _archetype_bonus(card: dict, prof: dict[str, Any] | None) -> float:
-    """按流派给这张牌加减分。流派不明的牌组返回 0（保持旧的「缺什么补什么」）。"""
+    """按流派给这张牌加减分。还没定型时给一点「顺着已有素材走」的推力。"""
     arch = str((prof or {}).get("archetype") or "")
     if not arch:
-        return 0.0
+        return _momentum_bonus(card, prof)
     desc = str(card.get("description") or "")
     low = desc.lower()
     ctype = str(card.get("type") or "")
@@ -2181,6 +2181,35 @@ def _archetype_bonus(card: dict, prof: dict[str, Any] | None) -> float:
             return 5.0
         return -1.0
     return 0.0
+
+
+def _momentum_bonus(card: dict, prof: dict[str, Any] | None) -> float:
+    """没定型时，顺着牌组里已有的素材轻轻推一把，让流派能长出来。
+
+    只取最强的一条线索（不叠加），而且素材只有一张时不给分——一张牌说明不了方向。
+    """
+    if not prof:
+        return 0.0
+    desc = str(card.get("description") or "")
+    low = desc.lower()
+    ctype = str(card.get("type") or "")
+    hits = _card_hits(desc)
+    best = 0.0
+    strength = float(prof.get("strength") or 0)
+    if strength >= 1 and ("力量" in desc or "strength" in low):
+        best = max(best, 3.0 if strength >= 2 else 1.5)
+    if strength >= 1 and hits >= 2:
+        best = max(best, 2.0)
+    exhaust = float(prof.get("exhaust") or 0)
+    if exhaust >= 1 and ("消耗" in desc or "exhaust" in low):
+        payoff = "每当" in desc and ("消耗" in desc or "exhaust" in low)
+        best = max(best, 4.0 if payoff else (2.5 if exhaust >= 2 else 1.5))
+    vuln = float(prof.get("vuln") or 0)
+    if vuln >= 1 and ("易伤" in desc or "vulnerable" in low):
+        best = max(best, 3.0 if vuln >= 2 else 1.5)
+    if float(prof.get("powers") or 0) >= 2 and ctype == "Power":
+        best = max(best, 2.0)
+    return best
 
 
 def _deck_fit(card: dict, prof: dict[str, Any] | None) -> float:
